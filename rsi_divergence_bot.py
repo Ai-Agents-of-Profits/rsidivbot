@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from colorama import Fore, Style
 import colorama
+import threading
 
 # --- Local Modules ---
 from state_manager_rsidiv import initialize_state, get_state, set_state, reset_state
@@ -28,6 +29,7 @@ TIMEFRAME = '1h'
 ORDER_SIZE_USD = 600  # Match your backtest
 FETCH_LIMIT = 200
 SCHEDULE_INTERVAL_SECONDS = 60
+TRAILING_STOP_FAST_INTERVAL = 5  # seconds
 USE_TESTNET = False
 
 # Strategy Parameters (Best Backtest)
@@ -99,6 +101,77 @@ def print_header():
 
 print_header()
 
+# --- Trailing Stop Helper ---
+def update_trailing_stop(state, price, atr_val):
+    is_long = state['position_side'] == 'long'
+    atr_at_entry = state.get('atr_at_entry', atr_val)
+    if is_long:
+        if state['highest'] is None or price > state['highest']:
+            state['highest'] = price
+        trail_dist = max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
+        new_trail = state['highest'] - trail_dist
+        if state['trailing_stop_level'] is None or new_trail > state['trailing_stop_level']:
+            state['trailing_stop_level'] = new_trail
+    else:
+        if state['lowest'] is None or price < state['lowest']:
+            state['lowest'] = price
+        trail_dist = max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
+        new_trail = state['lowest'] + trail_dist
+        if state['trailing_stop_level'] is None or new_trail < state['trailing_stop_level']:
+            state['trailing_stop_level'] = new_trail
+    return state
+
+def trailing_stop_checker():
+    while True:
+        time.sleep(TRAILING_STOP_FAST_INTERVAL)
+        state = get_state()
+        if not state.get('active_trade', False) or state.get('closing', False):
+            continue
+        try:
+            df = fetch_candles(exchange, SYMBOL, TIMEFRAME, FETCH_LIMIT)
+            if df.empty or len(df) < FETCH_LIMIT:
+                continue
+            df = compute_indicators(df, rsi_length=RSI_LENGTH, atr_length=ATR_LENGTH)
+            df = detect_rsi_divergence(df, swing_window=SWING_WINDOW, align_window=3)
+            df.dropna(inplace=True)
+            latest = df.iloc[-1]
+            price = latest['close']
+            atr_val = latest['ATR']
+            state = update_trailing_stop(state, price, atr_val)
+            # Check for exit
+            is_long = state['position_side'] == 'long'
+            if (is_long and price <= state['trailing_stop_level']) or (not is_long and price >= state['trailing_stop_level']):
+                if not state.get('closing', False):
+                    state['closing'] = True
+                    set_state(state)
+                    print(f"\n{Fore.RED}{Style.BRIGHT}FAST EXIT: Trailing stop hit! Closing {state['position_side']} position.{Style.RESET_ALL}")
+                    logging.info(f"FAST EXIT: Trailing stop hit! Closing {state['position_side']} position.")
+                    # Cancel SL/TP orders
+                    for oid in [state.get('sl_order_id'), state.get('tp_order_id')]:
+                        if oid:
+                            try:
+                                exchange.cancel_order(oid, SYMBOL, params={'category': 'linear'})
+                                logging.info(f"Cancelled open order: {oid}")
+                            except Exception as e:
+                                logging.warning(f"Failed to cancel order {oid}: {e}")
+                    # Market close
+                    positions = exchange.fetch_positions(symbols=[SYMBOL], params={'category': 'linear'})
+                    exch_pos = positions[0] if positions else None
+                    exch_size = float(exch_pos['info'].get('size', 0)) if exch_pos else 0
+                    side = 'sell' if is_long else 'buy'
+                    try:
+                        params = {'category': 'linear', 'reduceOnly': True}
+                        order = exchange.create_market_order(SYMBOL, side, exch_size, params=params)
+                        logging.info(f"Market close order placed: {order.get('id', 'N/A')}")
+                        reset_state()
+                        print(f"{Fore.MAGENTA}Position closed by trailing stop. State reset.{Style.RESET_ALL}")
+                    except Exception as e:
+                        logging.error(f"Market close FAILED: {e}")
+                continue
+            set_state(state)
+        except Exception as e:
+            logging.error(f"Error in trailing_stop_checker: {e}")
+
 # --- Main Bot Logic ---
 def bot_logic():
     now = datetime.now().strftime("%H:%M:%S")
@@ -134,50 +207,47 @@ def bot_logic():
         atr_val = latest['ATR']
         # --- EXIT LOGIC --- #
         if state.get('active_trade', False):
-            stop_loss_price = state.get('stop_loss_price')
-            target_price = state.get('target_price')
             entry_price = state.get('entry_price')
+            target_price = state.get('target_price')
             is_long = state['position_side'] == 'long'
             close_reason = None
-            # --- Exchange-native trailing stop: Let Bybit manage trailing stop ---
-            # No manual trailing stop logic here
-            if is_long:
-                if price <= stop_loss_price:
-                    close_reason = f"STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
-                elif price >= target_price:
-                    close_reason = f"PROFIT TARGET Hit! Price={price:.4f}, TP={target_price:.4f}"
-            else:
-                if price >= stop_loss_price:
-                    close_reason = f"STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
-                elif price <= target_price:
-                    close_reason = f"PROFIT TARGET Hit! Price={price:.4f}, TP={target_price:.4f}"
+            # Update trailing stop
+            state = update_trailing_stop(state, price, atr_val)
+            # Check for trailing stop exit
+            if (is_long and price <= state['trailing_stop_level']) or (not is_long and price >= state['trailing_stop_level']):
+                close_reason = f"TRAILING STOP Hit! Price={price:.4f}, Trail={state['trailing_stop_level']:.4f}"
+            elif (is_long and price >= target_price) or (not is_long and price <= target_price):
+                close_reason = f"PROFIT TARGET Hit! Price={price:.4f}, TP={target_price:.4f}"
             if close_reason:
-                print(f"\n{Fore.RED}{Style.BRIGHT}EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.{Style.RESET_ALL}")
-                logging.info(f"EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.")
-                # Cancel SL/TP/TS orders before market close
-                for oid in [state.get('sl_order_id'), state.get('tp_order_id'), state.get('ts_order_id')]:
-                    if oid:
-                        try:
-                            exchange.cancel_order(oid, SYMBOL, params={'category': 'linear'})
-                            logging.info(f"Cancelled open order: {oid}")
-                        except Exception as e:
-                            logging.warning(f"Failed to cancel order {oid}: {e}")
-                # Market close
-                side = 'sell' if is_long else 'buy'
-                try:
-                    params = {'category': 'linear', 'reduceOnly': True}
-                    order = exchange.create_market_order(SYMBOL, side, exch_size, params=params)
-                    logging.info(f"Market close order placed: {order.get('id', 'N/A')}")
-                    reset_state()
-                    print(f"{Fore.MAGENTA}Position closed successfully. State reset.{Style.RESET_ALL}")
-                except Exception as e:
-                    logging.error(f"Market close FAILED: {e}")
+                if not state.get('closing', False):
+                    state['closing'] = True
+                    set_state(state)
+                    print(f"\n{Fore.RED}{Style.BRIGHT}EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.{Style.RESET_ALL}")
+                    logging.info(f"EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.")
+                    # Cancel SL/TP orders before market close
+                    for oid in [state.get('sl_order_id'), state.get('tp_order_id')]:
+                        if oid:
+                            try:
+                                exchange.cancel_order(oid, SYMBOL, params={'category': 'linear'})
+                                logging.info(f"Cancelled open order: {oid}")
+                            except Exception as e:
+                                logging.warning(f"Failed to cancel order {oid}: {e}")
+                    # Market close
+                    side = 'sell' if is_long else 'buy'
+                    try:
+                        params = {'category': 'linear', 'reduceOnly': True}
+                        order = exchange.create_market_order(SYMBOL, side, exch_size, params=params)
+                        logging.info(f"Market close order placed: {order.get('id', 'N/A')}")
+                        reset_state()
+                        print(f"{Fore.MAGENTA}Position closed successfully. State reset.{Style.RESET_ALL}")
+                    except Exception as e:
+                        logging.error(f"Market close FAILED: {e}")
                 return
             else:
                 set_state(state)
                 profit_pct = ((price / entry_price - 1) * 100) if is_long else ((entry_price / price - 1) * 100)
                 profit_color = Fore.GREEN if profit_pct > 0 else Fore.RED
-                print(f"{Fore.CYAN}Active {Fore.GREEN if is_long else Fore.RED}{state['position_side'].upper()} position: Entry={entry_price:.4f}, Current={price:.4f}, SL={stop_loss_price:.4f}, TP={target_price:.4f}, P/L: {profit_color}{profit_pct:.2f}%")
+                print(f"{Fore.CYAN}Active {Fore.GREEN if is_long else Fore.RED}{state['position_side'].upper()} position: Entry={entry_price:.4f}, Current={price:.4f}, Trail={state['trailing_stop_level']:.4f}, TP={target_price:.4f}, P/L: {profit_color}{profit_pct:.2f}%")
                 logging.info("Holding position. No exit signal.")
         # --- ENTRY LOGIC --- #
         elif not state.get('active_trade', False):
@@ -205,28 +275,32 @@ def bot_logic():
                 logging.info(f"Entry order placed: {order.get('id', 'N/A')}")
                 print(f"{Fore.GREEN}Entry order placed: {order.get('id', 'N/A')}")
                 # Set stop loss and target
+                atr_at_entry = atr_val
                 if side == 'buy':
-                    stop_loss_price = price - max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
+                    stop_loss_price = price - max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
                     target_price = price + price * PROFIT_TARGET_PCT
-                    trailing_side = 'sell'
+                    trailing_stop_level = price - max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
+                    highest = price
+                    lowest = None
                 else:
-                    stop_loss_price = price + max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
+                    stop_loss_price = price + max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
                     target_price = price - price * PROFIT_TARGET_PCT
-                    trailing_side = 'buy'
+                    trailing_stop_level = price + max(ATR_MULTIPLIER * atr_at_entry, price * STOP_LOSS_PCT)
+                    highest = None
+                    lowest = price
                 price_decimals = step_to_decimals(PRICE_PRECISION)
                 stop_loss_price = float(f"{stop_loss_price:.{price_decimals}f}")
                 target_price = float(f"{target_price:.{price_decimals}f}")
-                # --- Place SL/TP/TS on Exchange ---
+                trailing_stop_level = float(f"{trailing_stop_level:.{price_decimals}f}")
+                # --- Place SL/TP on Exchange ---
                 sl_order = None
                 tp_order = None
-                ts_order = None
-                callback_rate = None  # ensure defined
                 try:
-                    # Determine trigger direction for stop/TP/TS
+                    # Determine trigger direction for stop/TP
                     trigger_direction = -1 if side == 'buy' else 1
                     # Stop loss (exchange side)
                     sl_order = exchange.create_order(
-                        SYMBOL, 'STOP_MARKET', trailing_side, amount_float, None,
+                        SYMBOL, 'STOP_MARKET', 'sell' if side == 'buy' else 'buy', amount_float, None,
                         {
                             'stopPrice': stop_loss_price,
                             'reduceOnly': True,
@@ -238,7 +312,7 @@ def bot_logic():
                     )
                     # Take profit (exchange side)
                     tp_order = exchange.create_order(
-                        SYMBOL, 'TAKE_PROFIT_MARKET', trailing_side, amount_float, None,
+                        SYMBOL, 'TAKE_PROFIT_MARKET', 'sell' if side == 'buy' else 'buy', amount_float, None,
                         {
                             'stopPrice': target_price,
                             'reduceOnly': True,
@@ -248,36 +322,24 @@ def bot_logic():
                             'triggerBy': 'MarkPrice'
                         }
                     )
-                    # Trailing stop (exchange-native)
-                    callback_rate = round(max(ATR_MULTIPLIER * atr_val / price, STOP_LOSS_PCT) * 100, 2)
-                    ts_params = {
-                        'reduceOnly': True,
-                        'category': 'linear',
-                        'callbackRate': callback_rate,  # percent
-                        'orderType': 'Market',
-                        'triggerPrice': price,
-                        'triggerBy': 'MarkPrice',
-                        'triggerDirection': trigger_direction
-                    }
-                    ts_order = exchange.create_order(
-                        SYMBOL, 'TRAILING_STOP_MARKET', trailing_side, amount_float, None, ts_params
-                    )
                     logging.info(f"Exchange SL order placed: {sl_order.get('id', 'N/A')}")
                     logging.info(f"Exchange TP order placed: {tp_order.get('id', 'N/A')}")
-                    logging.info(f"Exchange TS order placed: {ts_order.get('id', 'N/A')}")
-                    if callback_rate is not None:
-                        print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}, Trailing Stop (exchange): {callback_rate:.2f}%{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}, Trailing Stop (bot): {trailing_stop_level:.4f}{Style.RESET_ALL}")
                 except Exception as e:
-                    logging.error(f"Failed to place SL/TP/TS orders on exchange: {e}")
+                    logging.error(f"Failed to place SL/TP orders on exchange: {e}")
                 new_state = {
                     "active_trade": True,
                     "position_side": pos_side,
                     "entry_price": price,
                     "stop_loss_price": stop_loss_price,
                     "target_price": target_price,
+                    "highest": highest,
+                    "lowest": lowest,
+                    "trailing_stop_level": trailing_stop_level,
+                    "atr_at_entry": atr_at_entry,
                     "sl_order_id": sl_order.get('id') if sl_order else None,
                     "tp_order_id": tp_order.get('id') if tp_order else None,
-                    "ts_order_id": ts_order.get('id') if ts_order else None
+                    "closing": False
                 }
                 set_state(new_state)
                 logging.info(f"State updated: {new_state}")
@@ -296,6 +358,11 @@ print(f"\n{Fore.GREEN}{Style.BRIGHT}Starting RSI Divergence Bot{Style.RESET_ALL}
 print(f"{Fore.CYAN}Checking conditions every {SCHEDULE_INTERVAL_SECONDS} seconds. Press Ctrl+C to stop.{Style.RESET_ALL}\n")
 logging.info("Starting RSI Divergence Bot")
 schedule.every(SCHEDULE_INTERVAL_SECONDS).seconds.do(bot_logic)
+
+# Start trailing stop checker thread
+trailing_thread = threading.Thread(target=trailing_stop_checker, daemon=True)
+trailing_thread.start()
+
 bot_logic()
 while True:
     try:
