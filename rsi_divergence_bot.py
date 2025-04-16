@@ -25,7 +25,7 @@ logging.basicConfig(
 # --- Configuration ---
 SYMBOL = 'CORE/USDT:USDT'
 TIMEFRAME = '1h'
-ORDER_SIZE_USD = 1400  # Match your backtest
+ORDER_SIZE_USD = 600  # Match your backtest
 FETCH_LIMIT = 200
 SCHEDULE_INTERVAL_SECONDS = 60
 USE_TESTNET = False
