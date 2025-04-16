@@ -244,26 +244,48 @@ def bot_logic():
                 tp_order = None
                 try:
                     if side == 'buy':
-                        # Stop loss (sell stop market)
+                        # Long entry
                         sl_order = exchange.create_order(
                             SYMBOL, 'STOP_MARKET', 'sell', amount_float, None,
-                            {'stopPrice': stop_loss_price, 'reduceOnly': True, 'category': 'linear'}
+                            {
+                                'stopPrice': stop_loss_price,
+                                'reduceOnly': True,
+                                'category': 'linear',
+                                'triggerDirection': 2,
+                                'orderType': 'Market'
+                            }
                         )
-                        # Take profit (sell limit)
                         tp_order = exchange.create_order(
                             SYMBOL, 'TAKE_PROFIT_MARKET', 'sell', amount_float, None,
-                            {'stopPrice': target_price, 'reduceOnly': True, 'category': 'linear'}
+                            {
+                                'stopPrice': target_price,
+                                'reduceOnly': True,
+                                'category': 'linear',
+                                'triggerDirection': 1,
+                                'orderType': 'Market'
+                            }
                         )
                     else:
-                        # Stop loss (buy stop market)
+                        # Short entry
                         sl_order = exchange.create_order(
                             SYMBOL, 'STOP_MARKET', 'buy', amount_float, None,
-                            {'stopPrice': stop_loss_price, 'reduceOnly': True, 'category': 'linear'}
+                            {
+                                'stopPrice': stop_loss_price,
+                                'reduceOnly': True,
+                                'category': 'linear',
+                                'triggerDirection': 1,
+                                'orderType': 'Market'
+                            }
                         )
-                        # Take profit (buy limit)
                         tp_order = exchange.create_order(
                             SYMBOL, 'TAKE_PROFIT_MARKET', 'buy', amount_float, None,
-                            {'stopPrice': target_price, 'reduceOnly': True, 'category': 'linear'}
+                            {
+                                'stopPrice': target_price,
+                                'reduceOnly': True,
+                                'category': 'linear',
+                                'triggerDirection': 2,
+                                'orderType': 'Market'
+                            }
                         )
                     logging.info(f"Exchange SL order placed: {sl_order.get('id', 'N/A')}")
                     logging.info(f"Exchange TP order placed: {tp_order.get('id', 'N/A')}")
