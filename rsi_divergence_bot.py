@@ -139,40 +139,23 @@ def bot_logic():
             entry_price = state.get('entry_price')
             is_long = state['position_side'] == 'long'
             close_reason = None
-            # --- Trailing Stop Logic ---
-            # We'll store highest/lowest in state for persistence
-            highest = state.get('highest')
-            lowest = state.get('lowest')
+            # --- Exchange-native trailing stop: Let Bybit manage trailing stop ---
+            # No manual trailing stop logic here
             if is_long:
-                # Update highest price since entry
-                if highest is None or price > highest:
-                    highest = price
-                trail_dist = max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
-                new_stop = highest - trail_dist
-                # Only move stop up
-                if stop_loss_price is None or new_stop > stop_loss_price:
-                    stop_loss_price = new_stop
                 if price <= stop_loss_price:
-                    close_reason = f"TRAILING STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
+                    close_reason = f"STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
                 elif price >= target_price:
                     close_reason = f"PROFIT TARGET Hit! Price={price:.4f}, TP={target_price:.4f}"
             else:
-                if lowest is None or price < lowest:
-                    lowest = price
-                trail_dist = max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
-                new_stop = lowest + trail_dist
-                # Only move stop down
-                if stop_loss_price is None or new_stop < stop_loss_price:
-                    stop_loss_price = new_stop
                 if price >= stop_loss_price:
-                    close_reason = f"TRAILING STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
+                    close_reason = f"STOP LOSS Hit! Price={price:.4f}, SL={stop_loss_price:.4f}"
                 elif price <= target_price:
                     close_reason = f"PROFIT TARGET Hit! Price={price:.4f}, TP={target_price:.4f}"
             if close_reason:
                 print(f"\n{Fore.RED}{Style.BRIGHT}EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.{Style.RESET_ALL}")
                 logging.info(f"EXIT SIGNAL: {close_reason}. Closing {state['position_side']} position.")
-                # Cancel SL/TP orders before market close
-                for oid in [state.get('sl_order_id'), state.get('tp_order_id')]:
+                # Cancel SL/TP/TS orders before market close
+                for oid in [state.get('sl_order_id'), state.get('tp_order_id'), state.get('ts_order_id')]:
                     if oid:
                         try:
                             exchange.cancel_order(oid, SYMBOL, params={'category': 'linear'})
@@ -191,10 +174,6 @@ def bot_logic():
                     logging.error(f"Market close FAILED: {e}")
                 return
             else:
-                # Save trailing stop/highest/lowest to state
-                state['stop_loss_price'] = stop_loss_price
-                state['highest'] = highest
-                state['lowest'] = lowest
                 set_state(state)
                 profit_pct = ((price / entry_price - 1) * 100) if is_long else ((entry_price / price - 1) * 100)
                 profit_color = Fore.GREEN if profit_pct > 0 else Fore.RED
@@ -202,17 +181,17 @@ def bot_logic():
                 logging.info("Holding position. No exit signal.")
         # --- ENTRY LOGIC --- #
         elif not state.get('active_trade', False):
-            if latest['bullish_div']:
-                side = 'buy'
-                pos_side = 'long'
-            elif latest['bearish_div']:
-                side = 'sell'
-                pos_side = 'short'
-            else:
-                print(f"{Fore.YELLOW}No entry conditions met.{Style.RESET_ALL}")
-                logging.info("No entry conditions met.")
-                return
             try:
+                if latest['bullish_div']:
+                    side = 'buy'
+                    pos_side = 'long'
+                elif latest['bearish_div']:
+                    side = 'sell'
+                    pos_side = 'short'
+                else:
+                    print(f"{Fore.YELLOW}No entry conditions met.{Style.RESET_ALL}")
+                    logging.info("No entry conditions met.")
+                    return
                 amount = ORDER_SIZE_USD / price
                 amount_decimals = step_to_decimals(AMOUNT_PRECISION)
                 amount_str = f"{amount:.{amount_decimals}f}"
@@ -229,92 +208,79 @@ def bot_logic():
                 if side == 'buy':
                     stop_loss_price = price - max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
                     target_price = price + price * PROFIT_TARGET_PCT
-                    highest = price
-                    lowest = None
+                    trailing_side = 'sell'
                 else:
                     stop_loss_price = price + max(ATR_MULTIPLIER * atr_val, price * STOP_LOSS_PCT)
                     target_price = price - price * PROFIT_TARGET_PCT
-                    highest = None
-                    lowest = price
+                    trailing_side = 'buy'
                 price_decimals = step_to_decimals(PRICE_PRECISION)
                 stop_loss_price = float(f"{stop_loss_price:.{price_decimals}f}")
                 target_price = float(f"{target_price:.{price_decimals}f}")
-                # --- Place SL/TP on Exchange ---
+                # --- Place SL/TP/TS on Exchange ---
                 sl_order = None
                 tp_order = None
+                ts_order = None
                 try:
-                    if side == 'buy':
-                        # Long entry
-                        sl_order = exchange.create_order(
-                            SYMBOL, 'STOP_MARKET', 'sell', amount_float, None,
-                            {
-                                'stopPrice': stop_loss_price,
-                                'reduceOnly': True,
-                                'category': 'linear',
-                                'triggerDirection': 2,
-                                'orderType': 'Market'
-                            }
-                        )
-                        tp_order = exchange.create_order(
-                            SYMBOL, 'TAKE_PROFIT_MARKET', 'sell', amount_float, None,
-                            {
-                                'stopPrice': target_price,
-                                'reduceOnly': True,
-                                'category': 'linear',
-                                'triggerDirection': 1,
-                                'orderType': 'Market'
-                            }
-                        )
-                    else:
-                        # Short entry
-                        sl_order = exchange.create_order(
-                            SYMBOL, 'STOP_MARKET', 'buy', amount_float, None,
-                            {
-                                'stopPrice': stop_loss_price,
-                                'reduceOnly': True,
-                                'category': 'linear',
-                                'triggerDirection': 1,
-                                'orderType': 'Market'
-                            }
-                        )
-                        tp_order = exchange.create_order(
-                            SYMBOL, 'TAKE_PROFIT_MARKET', 'buy', amount_float, None,
-                            {
-                                'stopPrice': target_price,
-                                'reduceOnly': True,
-                                'category': 'linear',
-                                'triggerDirection': 2,
-                                'orderType': 'Market'
-                            }
-                        )
+                    # Stop loss (exchange side)
+                    sl_order = exchange.create_order(
+                        SYMBOL, 'STOP_MARKET', trailing_side, amount_float, None,
+                        {
+                            'stopPrice': stop_loss_price,
+                            'reduceOnly': True,
+                            'category': 'linear',
+                            'orderType': 'Market'
+                        }
+                    )
+                    # Take profit (exchange side)
+                    tp_order = exchange.create_order(
+                        SYMBOL, 'TAKE_PROFIT_MARKET', trailing_side, amount_float, None,
+                        {
+                            'stopPrice': target_price,
+                            'reduceOnly': True,
+                            'category': 'linear',
+                            'orderType': 'Market'
+                        }
+                    )
+                    # Trailing stop (exchange-native)
+                    # Bybit expects callbackRate as percent (e.g., 0.5 for 0.5%)
+                    callback_rate = round(max(ATR_MULTIPLIER * atr_val / price, STOP_LOSS_PCT) * 100, 2)
+                    ts_params = {
+                        'reduceOnly': True,
+                        'category': 'linear',
+                        'callbackRate': callback_rate,  # percent
+                        'orderType': 'Market',
+                        'triggerPrice': price,       # activate trailing at entry price
+                        'triggerBy': 'MarkPrice'     # use mark price for trail
+                    }
+                    ts_order = exchange.create_order(
+                        SYMBOL, 'TRAILING_STOP_MARKET', trailing_side, amount_float, None, ts_params
+                    )
                     logging.info(f"Exchange SL order placed: {sl_order.get('id', 'N/A')}")
                     logging.info(f"Exchange TP order placed: {tp_order.get('id', 'N/A')}")
+                    logging.info(f"Exchange TS order placed: {ts_order.get('id', 'N/A')}")
                 except Exception as e:
-                    logging.error(f"Failed to place SL/TP orders on exchange: {e}")
+                    logging.error(f"Failed to place SL/TP/TS orders on exchange: {e}")
                 new_state = {
                     "active_trade": True,
                     "position_side": pos_side,
                     "entry_price": price,
                     "stop_loss_price": stop_loss_price,
                     "target_price": target_price,
-                    "highest": highest,
-                    "lowest": lowest,
                     "sl_order_id": sl_order.get('id') if sl_order else None,
-                    "tp_order_id": tp_order.get('id') if tp_order else None
+                    "tp_order_id": tp_order.get('id') if tp_order else None,
+                    "ts_order_id": ts_order.get('id') if ts_order else None
                 }
                 set_state(new_state)
-                print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}")
+                print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}, Trailing Stop (exchange): {callback_rate:.2f}%{Style.RESET_ALL}")
                 logging.info(f"State updated: {new_state}")
-                time.sleep(5)
-            except ccxt.InsufficientFunds as e:
-                logging.error(f"Insufficient funds for entry: {e}")
-                print(f"{Fore.RED}{Style.BRIGHT}Insufficient funds for entry: {e}{Style.RESET_ALL}")
             except Exception as e:
-                logging.error(f"Entry error: {e}", exc_info=True)
-                print(f"{Fore.RED}{Style.BRIGHT}Entry error: {e}{Style.RESET_ALL}")
+                logging.error(f"Entry logic failed: {e}", exc_info=True)
+                print(f"{Fore.RED}{Style.BRIGHT}Entry logic failed: {e}{Style.RESET_ALL}")
+                return
     except Exception as e:
         logging.error(f"Unexpected Error in bot_logic: {e}", exc_info=True)
         print(f"{Fore.RED}{Style.BRIGHT}Unexpected Error in bot_logic: {e}{Style.RESET_ALL}")
+        return  # abort cycle on unexpected errors
     print(f"{Fore.CYAN}[{datetime.now().strftime('%H:%M:%S')}] Cycle completed {Style.RESET_ALL}")
     logging.info(f"--- RSI Divergence Cycle End ---\n")
 
