@@ -220,7 +220,10 @@ def bot_logic():
                 sl_order = None
                 tp_order = None
                 ts_order = None
+                callback_rate = None  # ensure defined
                 try:
+                    # Determine trigger direction for stop/TP/TS
+                    trigger_direction = -1 if side == 'buy' else 1
                     # Stop loss (exchange side)
                     sl_order = exchange.create_order(
                         SYMBOL, 'STOP_MARKET', trailing_side, amount_float, None,
@@ -228,7 +231,9 @@ def bot_logic():
                             'stopPrice': stop_loss_price,
                             'reduceOnly': True,
                             'category': 'linear',
-                            'orderType': 'Market'
+                            'orderType': 'Market',
+                            'triggerDirection': trigger_direction,
+                            'triggerBy': 'MarkPrice'
                         }
                     )
                     # Take profit (exchange side)
@@ -238,19 +243,21 @@ def bot_logic():
                             'stopPrice': target_price,
                             'reduceOnly': True,
                             'category': 'linear',
-                            'orderType': 'Market'
+                            'orderType': 'Market',
+                            'triggerDirection': trigger_direction,
+                            'triggerBy': 'MarkPrice'
                         }
                     )
                     # Trailing stop (exchange-native)
-                    # Bybit expects callbackRate as percent (e.g., 0.5 for 0.5%)
                     callback_rate = round(max(ATR_MULTIPLIER * atr_val / price, STOP_LOSS_PCT) * 100, 2)
                     ts_params = {
                         'reduceOnly': True,
                         'category': 'linear',
                         'callbackRate': callback_rate,  # percent
                         'orderType': 'Market',
-                        'triggerPrice': price,       # activate trailing at entry price
-                        'triggerBy': 'MarkPrice'     # use mark price for trail
+                        'triggerPrice': price,
+                        'triggerBy': 'MarkPrice',
+                        'triggerDirection': trigger_direction
                     }
                     ts_order = exchange.create_order(
                         SYMBOL, 'TRAILING_STOP_MARKET', trailing_side, amount_float, None, ts_params
@@ -258,6 +265,8 @@ def bot_logic():
                     logging.info(f"Exchange SL order placed: {sl_order.get('id', 'N/A')}")
                     logging.info(f"Exchange TP order placed: {tp_order.get('id', 'N/A')}")
                     logging.info(f"Exchange TS order placed: {ts_order.get('id', 'N/A')}")
+                    if callback_rate is not None:
+                        print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}, Trailing Stop (exchange): {callback_rate:.2f}%{Style.RESET_ALL}")
                 except Exception as e:
                     logging.error(f"Failed to place SL/TP/TS orders on exchange: {e}")
                 new_state = {
@@ -271,7 +280,6 @@ def bot_logic():
                     "ts_order_id": ts_order.get('id') if ts_order else None
                 }
                 set_state(new_state)
-                print(f"{Fore.YELLOW}Stop loss set at: {stop_loss_price:.4f}, Target: {target_price:.4f}, Trailing Stop (exchange): {callback_rate:.2f}%{Style.RESET_ALL}")
                 logging.info(f"State updated: {new_state}")
             except Exception as e:
                 logging.error(f"Entry logic failed: {e}", exc_info=True)
