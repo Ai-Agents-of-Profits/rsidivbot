@@ -7,7 +7,10 @@ DEFAULT_STATE = {
     "position_side": None,
     "entry_price": None,
     "stop_loss_price": None,
-    "target_price": None
+    "target_price": None,
+    "sl_order_id": None,
+    "tp_order_id": None,
+    "ts_order_id": None
 }
 STATE_FILE = 'state_rsidiv.json'
 
@@ -36,15 +39,20 @@ def get_state():
                'position_side' not in state or \
                'entry_price' not in state or \
                'stop_loss_price' not in state or \
-               'target_price' not in state:
+               'target_price' not in state or \
+               'sl_order_id' not in state or \
+               'tp_order_id' not in state or \
+               'ts_order_id' not in state:
                 logging.warning(f"Invalid state file format in {state_file}. Using default state.")
                 return DEFAULT_STATE.copy()
             return state
     except json.JSONDecodeError:
         logging.error(f"Error decoding JSON from {state_file}. Using default state.")
+        set_state(DEFAULT_STATE.copy())
         return DEFAULT_STATE.copy()
     except Exception as e:
         logging.error(f"Error loading state from {state_file}: {e}. Using default state.")
+        set_state(DEFAULT_STATE.copy())
         return DEFAULT_STATE.copy()
 
 def set_state(new_state):
