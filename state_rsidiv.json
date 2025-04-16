@@ -3,5 +3,8 @@
     "position_side": null,
     "entry_price": null,
     "stop_loss_price": null,
-    "target_price": null
+    "target_price": null,
+    "sl_order_id": null,
+    "tp_order_id": null,
+    "ts_order_id": null
 }
