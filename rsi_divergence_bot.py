@@ -56,10 +56,10 @@ try:
     # Check if we should use the proxy based on environment variable
     USE_PROXY = os.getenv('USE_PROXY', 'false').lower() == 'true'
     if USE_PROXY:
-        logging.info("Using Fixie proxy for connection")
+        logging.info("Using custom proxy for connection")
         exchange_config['proxies'] = {
-            'http': 'http://fixie:jqqXTVRSClx3W68@ventoux.usefixie.com:80',
-            'https': 'http://fixie:jqqXTVRSClx3W68@ventoux.usefixie.com:80'
+            'http': 'http://14ac0c35e3a68:2aa7219a85@136.175.224.200:12323/',
+            'https': 'http://14ac0c35e3a68:2aa7219a85@136.175.224.200:12323/'
         }
     else:
         logging.info("Connecting directly without proxy")
